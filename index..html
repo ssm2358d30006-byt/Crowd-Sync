@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>歓声リアクション（2モード）</title>
+<style>
+  * { box-sizing:border-box; }
+  html, body { margin:0; height:100%; background:#000; color:#fff; overflow:hidden;
+    font:15px/1.5 "Hiragino Sans","Yu Gothic","Noto Sans JP",sans-serif; }
+  #stage { position:fixed; inset:0; width:100%; height:100%; display:block; }
+  .bar { position:fixed; left:0; right:0; padding:10px 14px; display:flex; flex-wrap:wrap; gap:10px;
+    align-items:center; background:rgba(0,0,0,.78); }
+  #top { top:0; }
+  #bottom { bottom:0; }
+  body.ui-hidden .bar { display:none; }
+  button { font:inherit; color:#fff; background:#2b2b3d; border:1px solid #666; border-radius:8px; padding:10px 14px; cursor:pointer; }
+  button:focus-visible, input:focus-visible { outline:3px solid #38d9ff; outline-offset:2px; }
+  .mode { font-size:18px; font-weight:700; padding:16px 22px; min-width:230px; }
+  .mode.active { background:#ff3d8b; border-color:#ff3d8b; }
+  #manualBtn { font-size:18px; font-weight:700; padding:16px 22px; background:#ffc83d; color:#2a1d00; border-color:#ffc83d; }
+  #blackBtn { font-size:18px; font-weight:700; padding:16px 22px; background:#e5262b; border-color:#e5262b; }
+  #blackBtn.on { background:#fff; color:#000; border-color:#fff; }
+  #micBtn { background:#1fd1a5; color:#06251d; border-color:#1fd1a5; font-weight:700; }
+  #desc { flex-basis:100%; font-size:13px; color:#cfc8e8; }
+  label { display:flex; align-items:center; gap:8px; font-size:13px; }
+  input[type=range] { width:200px; accent-color:#ff3d8b; }
+  #meterWrap { position:relative; flex:1; min-width:140px; height:16px; background:#333; border-radius:8px; overflow:hidden; }
+  #fill { height:100%; width:0; background:linear-gradient(90deg,#1fd1a5,#ffc83d,#ff3d8b); }
+  #thLine { position:absolute; top:0; bottom:0; width:3px; background:#fff; }
+  #state { font-size:16px; font-weight:700; min-width:170px; }
+  #bands { font-size:12px; color:#cfc8e8; }
+  #msg { font-size:13px; color:#ffc83d; flex-basis:100%; }
+  #crowdChk { width:18px; height:18px; accent-color:#ff3d8b; }
+  #crowdSt { font-size:12px; color:#cfc8e8; min-width:90px; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+
+<div id="top" class="bar">
+  <button class="mode active" data-mode="stage">A　ステージ・音源連動（1）</button>
+  <button class="mode" data-mode="burst">B　歓声・熱量バースト（2）</button>
+  <button id="manualBtn">最大演出を発動（スペース）</button>
+  <button id="blackBtn">BLACKOUT（B）</button>
+  <span id="desc"></span>
+</div>
+
+<div id="bottom" class="bar">
+  <button id="micBtn">マイクを開始</button>
+  <div id="meterWrap"><div id="fill"></div><div id="thLine"></div></div>
+  <span id="state"></span>
+  <span id="bands"></span>
+  <label>感度（高いほど小さな音で反応） <input type="range" id="sens" min="1" max="10" step="0.1" value="4"><span id="sensV">4</span></label>
+  <label title="Aモードのみ。拍手・歓声が続いたとき、背景の明るさだけを少し上乗せします（初期値OFF）"><input type="checkbox" id="crowdChk">A：観客リアクション強調（明るさのみ）</label>
+  <span id="crowdSt"></span>
+  <button id="floorBtn">基準を今の音量に合わせる</button>
+  <button id="maxBtn">押している間 音量MAX（テスト）</button>
+  <button id="fsBtn">全画面（F）</button>
+  <button id="hideBtn">操作バーを隠す（H）</button>
+  <div id="msg"></div>
+</div>
+
+<script>
+// ================= 設定値（必要ならここを書き換え） =================
+const COOLDOWN_MS = 2000;   // モードB：一度発動したら、この時間は自動で再発動しない
+const THRESHOLD   = 0.6;    // モードB：盛り上がり度がこの値（0〜1）を超えたら発動
+const DECAY_S     = 3.5;    // 発動後、演出が消えるまでの秒数
+
+// ---- Aモード：観客リアクション強調（明るさの上乗せのみ） ----
+// ※下の値はすべて「実測前の仮設定」です。会場・マイク位置・音源に合わせて必ず調整してください。
+// ※マイク1本では音源中のクラップ／スネア／ボーカルと観客音を分離できません。
+//   そのため「しきい値を高め」「一定時間続いたときだけ」「長く続きすぎたら自動で止める」保守的な条件にしています。
+const CROWD_ACCENT_MAX   = 25;    //背景の明るさに足す最大値（明度%）。これ以上は絶対に上乗せしない
+const CROWD_V_ON         = 0.70;  // 歓声（exV）がこの値以上で「強調の候補」
+const CROWD_C_ON         = 0.70;  // 拍手（exC）がこの値以上で「強調の候補」
+const CROWD_V_OFF        = 0.40;  // 強調中、歓声（exV）がこの値を下回ったら終了へ（ヒステリシス）
+const CROWD_C_OFF        = 0.40;  // 強調中、拍手（exC）がこの値を下回ったら終了へ
+const CROWD_HOLD_MS      = 800;   // 候補状態がこの時間続いたときだけ強調を開始（単発のスネア等を除外）
+const CROWD_GAP_MS       = 300;   // 候補状態が途切れてもこの時間以内なら「続いている」とみなす
+const CROWD_RISE_S       = 1.2;   // 強調が最大に達するまでの秒数（急な点滅を防ぐ）
+const CROWD_FALL_S       = 2.5;   // 強調が消えるまでの秒数（なめらかに戻す）
+const CROWD_MAX_ACTIVE_MS= 8000;  // 強調が連続でこの時間続いたら、音源だけの可能性があるので強制終了
+const CROWD_LOCKOUT_MS   = 10000; // 強制終了後、この時間は再強調しない
+const CROWD_COOLDOWN_MS  = 2000;  // 通常終了後、この時間は再強調しない
+const CROWD_GUARD_MS     = 2000;  // ON切替・モード復帰・BLACKOUT解除の直後、この時間は強調しない
+
+const $ = id => document.getElementById(id);
+const cl = x => Math.min(1, Math.max(0, x));
+const canvas = $('stage'), ctx = canvas.getContext('2d');
+let W = 0, H = 0;
+function resize() { W = canvas.width = innerWidth; H = canvas.height = innerHeight; }
+addEventListener('resize', resize); resize();
+
+// ================= 状態 =================
+let mode = 'stage';                 // 'stage'（A）or 'burst'（B）
+let blackout = false, forceMax = false;
+let an = null, anF = null, fb = null, fbF = null, binHz = 23, barRanges = [];
+let hue = 280, particles = [], ripples = [];
+let env = 0, glow = 0, pulse = 0;   // env：発動後に数秒かけて減衰する演出の強さ
+
+// 共通の音データ
+let rLow = 0, rMid = 0, rHigh = 0, rVoice = 0, rClap = 0;
+const NB = 48, bars = new Array(NB).fill(0);
+// モードB（歓声）
+let floorV = 0, floorC = 0, floorInit = false;
+let exV = 0, exC = 0, hist = [], armed = true, lastFire = -1e9;
+// モードA（音源）
+let sLow = 0, sMid = 0, sHigh = 0, avgLow = 0, lastBeat = -1e9, beatTimes = [], bpm = 0;
+// モードA：観客リアクション強調（env / glow / pulse とは別の専用変数）
+let crowdOn = false;                // ON/OFF（初期値OFF）
+let crowdAccent = 0;                // 背景の明るさに上乗せする量（0〜1）
+let crowdActive = false, crowdHoldStart = 0, crowdLastLoud = 0, crowdActiveSince = 0, crowdLockUntil = 0;
+
+// ================= マイク =================
+$('micBtn').onclick = async () => {
+  if (an) return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    $('msg').textContent = 'このアドレスではマイクを使えません。http://localhost か https で開いてください';
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+    });
+    const ac = new (window.AudioContext || window.webkitAudioContext)();
+    await ac.resume();
+    const src = ac.createMediaStreamSource(stream);
+    an = ac.createAnalyser(); an.fftSize = 2048; an.smoothingTimeConstant = 0.6;    // なめらか（音源・歓声）
+    anF = ac.createAnalyser(); anF.fftSize = 2048; anF.smoothingTimeConstant = 0;   // 速い（拍手・キック）
+    src.connect(an); src.connect(anF);
+    fb = new Uint8Array(an.frequencyBinCount); fbF = new Uint8Array(anF.frequencyBinCount);
+    binHz = ac.sampleRate / an.fftSize;
+    barRanges = [];
+    for (let i = 0; i < NB; i++) {       // 40Hz〜8kHzを対数で48分割
+      const f1 = 40 * Math.pow(200, i / NB), f2 = 40 * Math.pow(200, (i + 1) / NB);
+      const b1 = Math.max(1, Math.floor(f1 / binHz));
+      barRanges.push([b1, Math.max(b1 + 1, Math.floor(f2 / binHz))]);
+    }
+    $('micBtn').textContent = 'マイク動作中';
+    $('msg').textContent = '';
+  } catch (err) {
+    const t = {
+      NotAllowedError: 'マイクが許可されていません。アドレスバーの鍵アイコンから「許可」にして再読み込みしてください',
+      NotFoundError: 'マイクが見つかりません。接続を確認してください',
+      NotReadableError: '他のアプリがマイクを使っています。Zoomなどを終了してください'
+    };
+    $('msg').textContent = t[err.name] || 'エラー: ' + err.name;
+  }
+};
+
+function band(arr, f1, f2) {            // 指定した周波数帯の平均の強さ（0〜1）
+  const i1 = Math.max(1, Math.floor(f1 / binHz)), i2 = Math.min(arr.length - 1, Math.ceil(f2 / binHz));
+  let s = 0; for (let i = i1; i <= i2; i++) s += arr[i];
+  return s / (i2 - i1 + 1) / 255;
+}
+const track = (f, v) => v < f ? f + (v - f) * 0.05 : f + (v - f) * 0.0004;   // 環境音の基準（下がるのは速く、上がるのはゆっくり）
+
+// ================= 音の分析（毎フレーム） =================
+function analyse(now, sens) {
+  let spike = false, beat = false, eV = 0, eC = 0, xl = 0, xm = 0, xh = 0, lowF = 0;
+
+  if (an) {
+    an.getByteFrequencyData(fb); anF.getByteFrequencyData(fbF);
+    lowF = band(fbF, 40, 200);
+    rLow = band(fb, 40, 200); rMid = band(fb, 200, 2000); rHigh = band(fb, 2000, 8000);
+    rVoice = band(fb, 500, 2000);       // 歓声
+    rClap = band(fbF, 2000, 8000);      // 拍手
+    if (!floorInit) { floorV = rVoice; floorC = rClap; avgLow = lowF; floorInit = true; }
+    floorV = track(floorV, rVoice); floorC = track(floorC, rClap);
+
+    eV = cl((rVoice - floorV) * sens);  // モードB：環境音との差分（低音は使わない）
+    eC = cl((rClap - floorC) * sens);
+    xl = cl(Math.pow(rLow, 2) * sens / 3);   // モードA：低音・中音・高音
+    xm = cl(Math.pow(rMid, 2) * sens / 3);
+    xh = cl(Math.pow(rHigh, 2) * sens / 3);
+    for (let i = 0; i < NB; i++) {      // イコライザーのバー
+      const [b1, b2] = barRanges[i];
+      let s = 0; for (let j = b1; j < b2; j++) s += fb[j];
+      const v = cl(Math.pow(s / (b2 - b1) / 255, 2.2) * (sens / 3) * (1 + i / 30));
+      bars[i] += (v - bars[i]) * (v > bars[i] ? 0.6 : 0.15);
+    }
+  }
+  if (forceMax) {                       // テスト用：マイクなしで最大入力
+    eV = 1; xl = xm = xh = 1;
+    for (let i = 0; i < NB; i++) bars[i] = 0.5 + Math.random() * 0.5;
+  }
+
+  exV += (eV - exV) * (eV > exV ? 0.5 : 0.07);
+  exC += (eC - exC) * (eC > exC ? 0.8 : 0.12);
+  sLow += (xl - sLow) * (xl > sLow ? 0.5 : 0.12);
+  sMid += (xm - sMid) * (xm > sMid ? 0.4 : 0.1);
+  sHigh += (xh - sHigh) * (xh > sHigh ? 0.4 : 0.1);
+
+  // 拍手＝短時間で急に立ち上がった高音域
+  hist.push(eC); if (hist.length > 6) hist.shift();
+  if (armed && eC >= THRESHOLD && eC - Math.min(...hist) > 0.15) { spike = true; armed = false; }
+  if (eC < THRESHOLD * 0.6) armed = true;
+
+  // ビート＝低音が普段の平均より急に強くなった瞬間（0.34秒未満の間隔では連続検知しない）
+  if (mode === 'stage' && !blackout && now - lastBeat > 340 &&
+      ((lowF - avgLow) * sens > 0.25 || (forceMax && now - lastBeat > 400))) {
+    beat = true;
+    if (now - lastBeat < 3000) {        // テンポ推定（直近の間隔の中央値）
+      beatTimes.push(now - lastBeat); if (beatTimes.length > 8) beatTimes.shift();
+      if (beatTimes.length >= 4) {
+        const s = [...beatTimes].sort((a, b) => a - b), med = s[Math.floor(s.length / 2)];
+        bpm = Math.round(60000 / med);
+      }
+    }
+    lastBeat = now;
+  }
+  if (now - lastBeat > 3000) { bpm = 0; beatTimes = []; }
+  avgLow += (lowF - avgLow) * 0.02;
+
+  return { spike, beat };
+}
+
+// ================= 演出パーツ =================
+function burst(clusters) {
+  const base = Math.random() * 360;
+  for (let n = 0; n < clusters; n++) {
+    const x = W * (0.15 + Math.random() * 0.7), y = H * (0.12 + Math.random() * 0.5);
+    for (let i = 0; i < 40; i++) {
+      const a = Math.random() * Math.PI * 2, s = (2 + Math.random() * 6) * (W / 900 + 0.4);
+      particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 1, d: 0.006 + Math.random() * 0.004, hue: base + n * 40 + Math.random() * 50 });
+    }
+  }
+}
+function ring(l) {
+  ctx.strokeStyle = `hsla(${hue + 180},100%,65%,0.9)`;
+  ctx.lineWidth = 3 + l * 30;
+  ctx.beginPath(); ctx.arc(W / 2, H * 0.42, Math.min(W, H) * (0.06 + l * 0.42), 0, Math.PI * 2); ctx.stroke();
+}
+function drawBars(scale, light) {
+  const w = W / NB;
+  for (let i = 0; i < NB; i++) {
+    const h = bars[i] * H * 0.8 * scale;
+    ctx.fillStyle = `hsl(${(hue + i * 6) % 360},95%,${light + bars[i] * 25}%)`;
+    ctx.fillRect(i * w + 2, H - h, w - 4, h);
+  }
+}
+function drawParticlesAndRipples() {
+  for (const p of particles) {
+    p.x += p.vx; p.y += p.vy; p.vy += 0.08; p.vx *= 0.99; p.life -= p.d;
+    ctx.fillStyle = `hsla(${p.hue},100%,65%,${Math.max(p.life, 0)})`;
+    ctx.beginPath(); ctx.arc(p.x, p.y, 2 + W / 500, 0, Math.PI * 2); ctx.fill();
+  }
+  particles = particles.filter(p => p.life > 0);
+  for (const r of ripples) {
+    r.r += H * 0.012; r.a -= 0.012;
+    if (r.a > 0 && r.r > 0) { ctx.strokeStyle = `rgba(255,255,255,${r.a})`; ctx.lineWidth = 6; ctx.beginPath(); ctx.arc(W / 2, H * 0.42, r.r, 0, Math.PI * 2); ctx.stroke(); }
+  }
+  ripples = ripples.filter(r => r.a > 0);
+}
+
+// 強調状態のリセット（guard=true なら、その後しばらく強調を開始しない）
+function resetCrowd(guard) {
+  crowdAccent = 0; crowdActive = false; crowdHoldStart = 0; crowdLastLoud = 0;
+  if (guard) crowdLockUntil = performance.now() + CROWD_GUARD_MS;
+}
+// 観客リアクション強調：exV / exC を「読むだけ」。ビート・BPM・hue・履歴・既存の状態は一切変更しない
+function crowdUpdate(now, dt) {
+  const loud = exV >= CROWD_V_ON || exC >= CROWD_C_ON;
+  const still = exV >= CROWD_V_OFF || exC >= CROWD_C_OFF;     // 強調中に「まだ続いている」と見なす条件
+  if (!crowdActive) {
+    if (now >= crowdLockUntil && loud) {
+      if (!crowdHoldStart || now - crowdLastLoud > CROWD_GAP_MS) crowdHoldStart = now;
+      crowdLastLoud = now;
+      if (now - crowdHoldStart >= CROWD_HOLD_MS) { crowdActive = true; crowdActiveSince = now; }
+    } else if (now - crowdLastLoud > CROWD_GAP_MS) {
+      crowdHoldStart = 0;
+    }
+  } else if (now - crowdActiveSince > CROWD_MAX_ACTIVE_MS) {   // 続きすぎ＝音源の可能性。強制終了
+    crowdActive = false; crowdHoldStart = 0; crowdLockUntil = now + CROWD_LOCKOUT_MS;
+  } else if (!still) {                                         // 通常終了
+    crowdActive = false; crowdHoldStart = 0; crowdLockUntil = now + CROWD_COOLDOWN_MS;
+  }
+  // 目標は 0 か 1 のみ（加算しないので上限を超えない）。一定速度で近づけるので急な点滅にならない
+  if (crowdActive) crowdAccent = Math.min(1, crowdAccent + dt / CROWD_RISE_S);
+  else crowdAccent = Math.max(0, crowdAccent - dt / CROWD_FALL_S);
+}
+
+// モードA：音の強弱とテンポに合わせて、連続的に明るさ・色が動く（単発の爆発はしない）
+function drawStage() {
+  hue = (hue + 0.2 + sMid * 3) % 360;
+  pulse *= 0.9;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  // crowdAccent は背景の明るさにだけ反映（OFF のときは 0 なので従来と完全に同じ）
+  ctx.fillStyle = `hsla(${hue},80%,${5 + sMid * 18 + pulse * 28 + env * 30 + crowdAccent * CROWD_ACCENT_MAX}%,0.35)`;
+  ctx.fillRect(0, 0, W, H);
+  drawBars(1, 45);
+  ring(sLow * 0.8 + pulse * 0.2 + env * 0.5);
+}
+
+// モードB：普段は静か。発動したら一気に炸裂して、数秒かけて減衰する
+function drawBurst() {
+  hue = (hue + 0.1 + env * 12) % 360;
+  glow *= 0.88;
+  const shake = env > 0.5 ? (env - 0.5) * 50 : 0;
+  ctx.setTransform(1, 0, 0, 1, (Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+  ctx.fillStyle = `hsla(${hue},85%,${5 + env * 38 + glow * 22}%,0.3)`;
+  ctx.fillRect(-30, -30, W + 60, H + 60);
+  ring(env * 0.9);
+  drawBars(env, 50);
+}
+
+function maxEffect(now) {               // 最大演出（自動発動・手動トリガー共通）
+  env = 1; glow = 1; pulse = 1;
+  burst(4);
+  ripples.push({ r: 0, a: 1 }, { r: -H * 0.12, a: 1 }, { r: -H * 0.24, a: 1 });
+}
+
+// ================= メインループ =================
+let lastT = performance.now(), lastUi = 0;
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min(0.1, (now - lastT) / 1000); lastT = now;
+  const sens = +$('sens').value;
+  const { spike, beat } = analyse(now, sens);
+  $('sensV').textContent = sens;
+
+  // メーター
+  const main = mode === 'burst' ? exV : Math.max(sLow, sMid);
+  $('fill').style.width = (main * 100) + '%';
+  $('thLine').style.display = mode === 'burst' ? 'block' : 'none';
+  $('thLine').style.left = (THRESHOLD * 100) + '%';
+  if (now - lastUi > 100) {
+    lastUi = now;
+    const f = v => Math.round(v * 100);
+    const rem = Math.max(0, COOLDOWN_MS - (now - lastFire));
+    if (blackout) $('state').textContent = 'BLACKOUT中';
+    else if (mode === 'burst') $('state').textContent = env > 0.02 ? '発動中（減衰）' : rem > 0 ? `クールダウン ${(rem / 1000).toFixed(1)}秒` : '待機中';
+    else $('state').textContent = bpm ? `テンポ推定 約${bpm} BPM` : 'テンポ検出待ち';
+    $('bands').textContent = mode === 'burst'
+      ? `歓声 ${f(exV)} ／ 拍手 ${f(exC)}（しきい値 ${f(THRESHOLD)}）`
+      : `低 ${f(sLow)} ／ 中 ${f(sMid)} ／ 高 ${f(sHigh)}`;
+    $('crowdSt').textContent = !crowdOn ? 'OFF' : mode !== 'stage' ? 'Aモードのみ有効'
+      : blackout ? '停止中' : crowdActive ? `強調中 ${f(crowdAccent)}%` : crowdAccent > 0 ? '戻し中' : '待機';
+  }
+
+  // BLACKOUT：押した瞬間にすべてゼロ（真っ暗）。演出の状態も強制リセット
+  if (blackout) {
+    particles = []; ripples = []; env = 0; glow = 0; pulse = 0;
+    resetCrowd(false);                  // 観客リアクション強調も完全にゼロ
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+    return;
+  }
+
+  env = Math.max(0, env - dt / DECAY_S);   // 数秒かけて減衰
+
+  if (mode === 'burst') {
+    // しきい値を超えた瞬間だけ発動。2秒間は再発動しない
+    if (now - lastFire >= COOLDOWN_MS && (exV >= THRESHOLD || spike)) {
+      maxEffect(now); lastFire = now;
+    }
+    drawBurst();
+  } else {
+    if (beat) { pulse = 1; hue = (hue + 25) % 360; }
+    if (crowdOn) crowdUpdate(now, dt);  // OFF のときは何も実行しない（従来どおり）
+    drawStage();
+  }
+  drawParticlesAndRipples();
+}
+requestAnimationFrame(frame);
+
+// ================= 操作 =================
+const DESC = {
+  stage: 'A：ボーカルや低音・中音に合わせて、光と色が滑らかに動き続けます（自動の爆発はしません）',
+  burst: 'B：普段は静か。歓声・拍手がしきい値を超えた瞬間だけ炸裂し、数秒で減衰します（発動後2秒は再発動しません）'
+};
+function setMode(m) {
+  mode = m;
+  document.querySelectorAll('.mode').forEach(b => b.classList.toggle('active', b.dataset.mode === m));
+  $('desc').textContent = DESC[m];
+  particles = []; ripples = []; env = 0; glow = 0; pulse = 0;   // 切替時は演出をリセット
+  resetCrowd(true);                     // A専用の強調量もリセット（戻っても引き継がない）
+}
+document.querySelectorAll('.mode').forEach(b => b.addEventListener('click', () => setMode(b.dataset.mode)));
+setMode('stage');
+
+function manualTrigger() {              // マイクの音量に関係なく、どちらのモードでも最大演出
+  if (blackout) return;
+  maxEffect(performance.now());
+  lastFire = performance.now();         // 直後に自動発動が重ならないようにする
+}
+function toggleBlackout() {
+  blackout = !blackout;
+  resetCrowd(true);                     // 切替のたびに強調状態を消し、解除直後の突然の強調を防ぐ
+  $('blackBtn').classList.toggle('on', blackout);
+  $('blackBtn').textContent = blackout ? 'BLACKOUT 解除（B）' : 'BLACKOUT（B）';
+}
+function toggleFullscreen() {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen().catch(() => {});
+}
+$('manualBtn').onclick = manualTrigger;
+$('blackBtn').onclick = toggleBlackout;
+$('fsBtn').onclick = toggleFullscreen;
+$('hideBtn').onclick = () => document.body.classList.add('ui-hidden');
+$('floorBtn').onclick = () => { floorV = rVoice; floorC = rClap; };
+$('crowdChk').onchange = e => {
+  crowdOn = e.target.checked;
+  resetCrowd(true);                     // ON/OFFどちらでも強調量を即ゼロに（OFFで即座に元の明るさ）
+  e.target.blur();                      // スペースキー（最大演出）と干渉しないようにする
+};
+
+const mb = $('maxBtn');
+mb.addEventListener('pointerdown', () => { forceMax = true; });
+['pointerup', 'pointerleave', 'pointercancel'].forEach(e => mb.addEventListener(e, () => { forceMax = false; }));
+
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (e.key === ' ') { e.preventDefault(); manualTrigger(); }
+  else if (k === 'b') toggleBlackout();
+  else if (k === 'f') toggleFullscreen();
+  else if (k === 'h') document.body.classList.toggle('ui-hidden');
+  else if (k === '1') setMode('stage');
+  else if (k === '2') setMode('burst');
+});
+document.addEventListener('click', e => { if (e.target.tagName === 'BUTTON') e.target.blur(); });
+</script>
+</body>
+</html>
